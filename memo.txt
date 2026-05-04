@@ -1,0 +1,242 @@
+# Star AI Robot Arm ROS無し推論手順メモ
+
+前提:
+- 作業ディレクトリは `/home/kazu/RISE`
+- 学習済みチェックポイントは `policy_and_value/policy_offline_and_value/checkpoints/Pi05_style_training/Pi05_style_training/10000`
+- プロンプトは `Untangle the parts`
+- 推論環境にROSは不要
+- StarAI Follower ArmはFashionstar UC-01のシリアルポート、例 `/dev/ttyUSB1`、へ直接接続する
+
+## 1. uvで推論環境を作る
+
+OpenCVのwheel互換性を安定させるため、Python 3.11で作る。
+
+```bash
+cd /home/kazu/RISE
+uv venv .venv-star --python 3.11
+source .venv-star/bin/activate
+uv pip install -r requirements.txt
+```
+
+一行で実施する場合:
+
+```bash
+cd /home/kazu/RISE && uv venv .venv-star --python 3.11 && source .venv-star/bin/activate && uv pip install -r requirements.txt
+```
+
+確認:
+
+```bash
+python - <<'PY'
+import cv2
+from openpi_client import websocket_client_policy
+print("no-ROS Star inference env OK")
+PY
+```
+
+## 2. GPU側でポリシーサーバを起動する
+
+別端末A:
+
+```bash
+cd /home/kazu/RISE
+conda activate rise
+./deploy/serve_green_tag_policy.sh
+```
+
+明示的に10000 checkpointを使う場合:
+
+```bash
+cd /home/kazu/RISE
+conda activate rise
+./deploy/serve_green_tag_policy.sh \
+  /home/kazu/RISE/policy_and_value/policy_offline_and_value/checkpoints/Pi05_style_training/Pi05_style_training/10000
+```
+
+サーバはデフォルトで `0.0.0.0:8000` に立つ。
+別PCから接続する場合は、推論端末側の `HOST` にGPUマシンのIPを指定する。
+
+## 3. 入出力の考え方
+
+ROS無し版は、OpenCVで読める3つの画像ソースと、StarAIのシリアルポート、またはJSONの関節状態をポリシーへ送る。
+
+カメラ対応:
+- `--side_source` -> policy `top_head`
+- `--rear_source` -> policy `hand_left`
+- `--onhand_source` -> policy `hand_right`
+
+画像ソースには以下を指定できる:
+- USBカメラ番号: `0`, `1`, `2`
+- 画像ファイル: `/path/to/side.jpg`
+- 動画ファイル: `/path/to/side.mp4`
+- RTSP/HTTP URL: `rtsp://...`
+
+StarAIへ直接接続する場合は、`--starai_port /dev/ttyUSB1` を指定する。
+この場合、関節状態はStarAIから読み、推論結果もStarAIへ直接送る。
+
+```bash
+sudo chmod 666 /dev/ttyUSB*
+```
+
+`/dev/ttyUSB*` が見つからない場合は、UC-01を挿し直してから以下を確認する。
+
+```bash
+lsusb
+dmesg | grep ttyUSB
+```
+
+JSONファイルで関節状態を差し込むこともできる。デフォルトは `/tmp/star_ai_joint_state.json`。
+形式はどちらでもよい:
+
+```json
+[0.0, 0.32, -0.36, 0.0, 0.24, 0.0, 0.07]
+```
+
+```json
+{"position": [0.0, 0.32, -0.36, 0.0, 0.24, 0.0, 0.07]}
+```
+
+推論結果のコマンドは、StarAIへ直接送るか、JSONとして外へ出す。出力先は `--command_sink` で選ぶ。
+
+- `starai`: StarAI実機へ直接送信。`--starai_port` が必要
+- `stdout`: 標準出力へ1行JSON
+- `file`: 最新コマンドをJSONファイルへ上書き
+- `jsonl`: コマンド履歴をJSON Linesへ追記
+- `udp`: UDPでJSON送信
+- `tcp`: TCPでJSON Lines送信
+
+`--starai_port` を指定した場合、`--joint_state_source auto` と `--command_sink auto` は自動的に `starai` になる。
+
+この学習済みポリシーの状態・行動はラジアン系なので、StarAIへ送る直前に度数へ変換する。デフォルトは `--starai_policy_units radians`。
+
+出力JSON例:
+
+```json
+{
+  "timestamp": 1777900000.0,
+  "step": 0,
+  "joint_names": ["joint0", "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+  "position": [0.01, 0.30, -0.34, 0.0, 0.22, 0.0, 0.06],
+  "prompt": "Untangle the parts"
+}
+```
+
+## 4. まずStarAIに接続してdry-runする
+
+StarAIの現在関節角を読み、推論だけ行い、実機へは送らず標準出力に出す。
+
+```bash
+cd /home/kazu/RISE
+source .venv-star/bin/activate
+
+HOST=localhost \
+PORT=8000 \
+./deploy/run_star_ai_green_tag_no_ros.sh \
+  --side_source 0 \
+  --rear_source 1 \
+  --onhand_source 2 \
+  --starai_port /dev/ttyUSB1 \
+  --dry_run \
+  --no_confirm \
+  --run_once
+```
+
+画像ファイルで確認する場合:
+
+```bash
+HOST=localhost \
+PORT=8000 \
+./deploy/run_star_ai_green_tag_no_ros.sh \
+  --side_source /path/to/side.jpg \
+  --rear_source /path/to/rear.jpg \
+  --onhand_source /path/to/onhand.jpg \
+  --starai_port /dev/ttyUSB1 \
+  --dry_run \
+  --run_once \
+  --no_confirm
+```
+
+## 5. StarAIへ直接コマンドを送る
+
+dry-runが問題なければ `--dry_run` を外す。
+
+```bash
+cd /home/kazu/RISE
+source .venv-star/bin/activate
+
+HOST=localhost \
+PORT=8000 \
+./deploy/run_star_ai_green_tag_no_ros.sh \
+  --side_source 0 \
+  --rear_source 1 \
+  --onhand_source 2 \
+  --starai_port /dev/ttyUSB1 \
+  --joint_names joint0,joint1,joint2,joint3,joint4,joint5,joint6
+```
+
+起動後、初期関節角が表示され、Enter待ちになる。安全確認後にEnterを押す。
+
+必要に応じて調整する:
+
+- `--starai_motion_time_ms 350`: サーボの目標到達時間
+- `--starai_power 1000`: Fashionstar SDKへ渡すpower
+- `--max_joint_delta 0.05`: 1制御ステップの上限。大きく動く場合は小さくする
+- `--starai_reset_loop`: 接続時にmulti-turn angleをリセットする。現在姿勢をゼロ扱いにしたい場合のみ使う
+
+## 6. JSONファイルやUDPへ出す場合
+
+実機送信を別プロセスに任せたい場合は、StarAI直結ではなくJSON出力も使える。
+
+例: 最新コマンドを `/tmp/star_ai_command.json` へ上書きする。
+
+```bash
+cat > /tmp/star_ai_joint_state.json <<'JSON'
+{"position": [0.0, 0.32, -0.36, 0.0, 0.24, 0.0, 0.07]}
+JSON
+
+HOST=localhost \
+PORT=8000 \
+./deploy/run_star_ai_green_tag_no_ros.sh \
+  --side_source 0 \
+  --rear_source 1 \
+  --onhand_source 2 \
+  --joint_state_source file \
+  --joint_state_file /tmp/star_ai_joint_state.json \
+  --command_sink file \
+  --command_file /tmp/star_ai_command.json
+```
+
+Star側アダプタが `127.0.0.1:5005` でUDP JSONを待つ場合:
+
+```bash
+HOST=localhost \
+PORT=8000 \
+./deploy/run_star_ai_green_tag_no_ros.sh \
+  --side_source 0 \
+  --rear_source 1 \
+  --onhand_source 2 \
+  --joint_state_source file \
+  --joint_state_file /tmp/star_ai_joint_state.json \
+  --command_sink udp \
+  --command_host 127.0.0.1 \
+  --command_port 5005
+```
+
+## 7. よく変更するオプション
+
+- `HOST=...`: ポリシーサーバのIP
+- `PORT=8000`: ポリシーサーバのポート
+- `--side_source/--rear_source/--onhand_source`: カメラ番号、画像、動画、URL
+- `--starai_port /dev/ttyUSB1`: StarAI Follower ArmのUC-01ポート
+- `--starai_policy_units radians|degrees`: ポリシー出力をStarAIへ送る時の単位。今回のgreen_tagは `radians`
+- `--joint_state_source auto|starai|zeros|file|stdin`: 関節状態の入力元
+- `--joint_state_file`: 関節状態JSONファイル
+- `--command_sink auto|starai|stdout|file|jsonl|udp|tcp`: コマンド出力先
+- `--action_start 0`: ポリシー行動のどの次元から使うか
+- `--arm_dof 7`: Starへ送る関節数
+- `--max_joint_delta 0.05`: 1ステップあたりの関節角変化上限
+- `--no_confirm`: Enter確認なしで開始
+
+## 8. 停止
+
+推論端末で `Ctrl+C`。

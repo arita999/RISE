@@ -1,7 +1,9 @@
 import os
 os.environ["SVT_LOG"] = "1"
 
-from typing import List, Dict, Tuple
+import json
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Any
 from pathlib import Path
 import shutil
 import logging
@@ -13,8 +15,11 @@ import numpy as np
 import tyro
 import av
 import h5py
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from mini_lerobot.builder import LeRobotDatasetBuilder
+from mini_lerobot.metadata import DEFAULT_FEATURES
 
 
 # * Example usage:
@@ -22,6 +27,7 @@ from mini_lerobot.builder import LeRobotDatasetBuilder
 
 
 OPTIONAL_FEATURES = ("noise", "inferred_action")
+LEROBOT_DEFAULT_FEATURE_KEYS = set(DEFAULT_FEATURES.keys())
 
 FEATURES = {
     "observation.images.top_head": {
@@ -82,6 +88,113 @@ FEATURES = {
         "shape": (700,),
     }
 }
+
+
+@dataclass(frozen=True)
+class LeRobotV3Episode:
+    episode_index: int
+    length: int
+    tasks: tuple[str, ...]
+    data_chunk_index: int
+    data_file_index: int
+    video_spans: dict[str, tuple[int, int, float, float]]
+
+
+def is_lerobot_v3_dataset(data_dir: Path) -> bool:
+    return (
+        (data_dir / "meta" / "info.json").is_file()
+        and (data_dir / "data").is_dir()
+        and (data_dir / "meta" / "episodes").is_dir()
+    )
+
+
+def format_lerobot_v3_path(
+    path_template: str,
+    *,
+    chunk_index: int,
+    file_index: int,
+    video_key: str | None = None,
+) -> str:
+    return path_template.format(
+        chunk_index=chunk_index,
+        file_index=file_index,
+        video_key=video_key,
+    )
+
+
+def arrow_column_to_numpy(column: pa.ChunkedArray | pa.Array) -> np.ndarray:
+    if isinstance(column, pa.ChunkedArray):
+        column = column.combine_chunks()
+
+    if isinstance(column, pa.FixedSizeListArray):
+        flat_values = column.flatten().to_numpy(zero_copy_only=False)
+        return flat_values.reshape(len(column), column.type.list_size)
+
+    if isinstance(column, (pa.ListArray, pa.LargeListArray)):
+        return np.array(column.to_pylist())
+
+    return column.to_numpy(zero_copy_only=False)
+
+
+def load_lerobot_v3_info(data_dir: Path) -> dict[str, Any]:
+    with open(data_dir / "meta" / "info.json", "r") as f:
+        return json.load(f)
+
+
+def resolve_lerobot_v3_features(info: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    features = {}
+    for key, feature in info["features"].items():
+        if key in LEROBOT_DEFAULT_FEATURE_KEYS:
+            continue
+
+        resolved = {
+            "dtype": feature["dtype"],
+            "shape": tuple(feature["shape"]),
+        }
+        if feature.get("names") is not None:
+            resolved["names"] = feature["names"]
+        features[key] = resolved
+    return features
+
+
+def load_lerobot_v3_episodes(data_dir: Path, video_keys: list[str]) -> list[LeRobotV3Episode]:
+    episode_files = sorted((data_dir / "meta" / "episodes").rglob("*.parquet"))
+    if not episode_files:
+        raise FileNotFoundError(f"No episode metadata parquet files found under {data_dir / 'meta' / 'episodes'}")
+
+    episodes = []
+    for episode_file in episode_files:
+        table = pq.read_table(episode_file)
+        columns = table.to_pydict()
+
+        for row in range(table.num_rows):
+            video_spans = {}
+            for video_key in video_keys:
+                video_prefix = f"videos/{video_key}"
+                video_spans[video_key] = (
+                    int(columns[f"{video_prefix}/chunk_index"][row]),
+                    int(columns[f"{video_prefix}/file_index"][row]),
+                    float(columns[f"{video_prefix}/from_timestamp"][row]),
+                    float(columns[f"{video_prefix}/to_timestamp"][row]),
+                )
+
+            episodes.append(
+                LeRobotV3Episode(
+                    episode_index=int(columns["episode_index"][row]),
+                    length=int(columns["length"][row]),
+                    tasks=tuple(columns["tasks"][row]),
+                    data_chunk_index=int(columns["data/chunk_index"][row]),
+                    data_file_index=int(columns["data/file_index"][row]),
+                    video_spans=video_spans,
+                )
+            )
+
+    episodes.sort(key=lambda episode: episode.episode_index)
+    expected_indices = list(range(len(episodes)))
+    actual_indices = [episode.episode_index for episode in episodes]
+    if actual_indices != expected_indices:
+        raise ValueError(f"Episode indices are not contiguous: first indices are {actual_indices[:10]}")
+    return episodes
 
 
 def resolve_output_features(valid_files: List[Path]) -> tuple[Dict, set[str]]:
@@ -221,6 +334,195 @@ def encode_video_frames(
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
 
 
+def encode_video_segment(
+    src: Path,
+    dst: Path,
+    fps: int,
+    start_frame: int,
+    num_frames: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+):
+    if num_frames <= 0:
+        raise ValueError(f"num_frames must be positive, got {num_frames}")
+    if not src.exists():
+        raise FileNotFoundError(f"Source video not found: {src}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    logging.getLogger("libav").setLevel(av.logging.ERROR)
+
+    video_options = {"g": str(g), "crf": str(crf)}
+    if os.getenv("FFMPEG_SINGLE_THREAD", "0") == "1":
+        video_options["svtav1-params"] = "lp=1"
+
+    with av.open(str(src), "r") as input_container, av.open(str(dst), "w") as output_container:
+        input_stream = input_container.streams.video[0]
+        input_stream.thread_type = "AUTO"
+
+        frame_duration_pts = int(round((1 / fps) / input_stream.time_base))
+        seek_pts = max(0, start_frame - 2) * frame_duration_pts
+        input_container.seek(seek_pts, stream=input_stream, any_frame=False, backward=True)
+
+        output_stream = output_container.add_stream(vcodec, fps, options=video_options)
+        output_stream.pix_fmt = pix_fmt
+        output_stream.width = input_stream.width
+        output_stream.height = input_stream.height
+
+        stop_frame = start_frame + num_frames
+        written = 0
+        done = False
+
+        for packet in input_container.demux(input_stream):
+            for frame in packet.decode():
+                if frame.pts is None:
+                    continue
+                frame_index = int(round((frame.pts * input_stream.time_base) * fps))
+                if frame_index < start_frame:
+                    continue
+                if frame_index >= stop_frame:
+                    done = True
+                    break
+
+                output_frame = frame.to_rgb()
+                output_frame.pts = None
+                encoded_packet = output_stream.encode(output_frame)
+                if encoded_packet:
+                    output_container.mux(encoded_packet)
+                written += 1
+
+                if written == num_frames:
+                    done = True
+                    break
+
+            if done:
+                break
+
+        encoded_packet = output_stream.encode()
+        if encoded_packet:
+            output_container.mux(encoded_packet)
+
+    if written != num_frames:
+        raise RuntimeError(f"Encoded {written} frames from {src}, expected {num_frames}")
+    if not dst.exists():
+        raise OSError(f"Video encoding did not work. File not found: {dst}.")
+
+
+def read_lerobot_v3_episode_table(
+    data_path: Path,
+    episode_index: int,
+    feature_specs: dict[str, dict[str, Any]],
+) -> dict[str, np.ndarray]:
+    table = pq.read_table(data_path, columns=[*feature_specs.keys(), "episode_index"])
+    episode_indices = arrow_column_to_numpy(table["episode_index"])
+    mask = episode_indices == episode_index
+    if not np.any(mask):
+        raise ValueError(f"Episode {episode_index} not found in {data_path}")
+
+    feature_data = {}
+    for key, feature in feature_specs.items():
+        array = arrow_column_to_numpy(table[key])[mask]
+        feature_data[key] = array.astype(np.dtype(feature["dtype"]), copy=False)
+    return feature_data
+
+
+def produce_lerobot_v3_episode(
+    video_map: dict[str, Path],
+    episode: LeRobotV3Episode,
+    *,
+    source_root: Path,
+    data_path_template: str,
+    video_path_template: str | None,
+    feature_specs: dict[str, dict[str, Any]],
+    fps: int,
+    prompt: str | None,
+):
+    data_path = source_root / format_lerobot_v3_path(
+        data_path_template,
+        chunk_index=episode.data_chunk_index,
+        file_index=episode.data_file_index,
+    )
+    feature_data = read_lerobot_v3_episode_table(data_path, episode.episode_index, feature_specs)
+
+    if video_map and video_path_template is None:
+        raise ValueError("Video features are present but source metadata has no video_path")
+
+    for video_key, video_dst in video_map.items():
+        video_chunk_index, video_file_index, from_timestamp, to_timestamp = episode.video_spans[video_key]
+        video_src = source_root / format_lerobot_v3_path(
+            video_path_template,
+            chunk_index=video_chunk_index,
+            file_index=video_file_index,
+            video_key=video_key,
+        )
+        start_frame = int(round(from_timestamp * fps))
+        stop_frame = int(round(to_timestamp * fps))
+        if stop_frame - start_frame != episode.length:
+            print(
+                f"  Warning: episode {episode.episode_index} metadata has "
+                f"{stop_frame - start_frame} video frames but {episode.length} table rows; using table length."
+            )
+        encode_video_segment(video_src, video_dst, fps, start_frame, episode.length)
+
+    task = prompt if prompt is not None else (episode.tasks[0] if episode.tasks else "")
+    return feature_data, [task] * episode.length
+
+
+def convert_lerobot_v3_dataset(
+    data_dir: Path,
+    save_dir: Path | str,
+    save_repoid: str,
+    prompt: str | None,
+    max_workers: int,
+    overwrite: bool,
+    only_sync: bool,
+) -> Path:
+    info = load_lerobot_v3_info(data_dir)
+    features = resolve_lerobot_v3_features(info)
+    video_keys = [key for key, feature in features.items() if feature["dtype"] == "video"]
+    table_feature_specs = {key: feature for key, feature in features.items() if feature["dtype"] != "video"}
+    episodes = load_lerobot_v3_episodes(data_dir, video_keys)
+    output_path = Path(save_dir) / save_repoid
+
+    print(
+        f"Detected LeRobot dataset at {data_dir}. "
+        f"Converting {len(episodes)} episodes with features: {', '.join(features.keys())}"
+    )
+
+    if only_sync:
+        return output_path
+
+    if output_path.exists():
+        if overwrite:
+            shutil.rmtree(output_path)
+        else:
+            raise FileExistsError(f"Output path {output_path} already exists. Use --overwrite to overwrite.")
+
+    builder = LeRobotDatasetBuilder(
+        repo_id=save_repoid,
+        fps=int(info["fps"]),
+        features=features,
+        robot_type=info.get("robot_type"),
+        root=output_path,
+    )
+    builder.add_episodes(
+        partial(
+            produce_lerobot_v3_episode,
+            source_root=data_dir,
+            data_path_template=info["data_path"],
+            video_path_template=info.get("video_path"),
+            feature_specs=table_feature_specs,
+            fps=int(info["fps"]),
+            prompt=prompt,
+        ),
+        episodes,
+        max_workers=max_workers,
+    )
+    builder.flush()
+    return output_path
+
+
 def produce_episode(
     video_map: dict[str, Path],
     log_dir: Path,
@@ -289,7 +591,7 @@ def produce_episode(
 def main(
     data_dir: Path | str,
     save_dir: Path | str,
-    repo_ids: List[str] | str,
+    repo_ids: List[str] | str | None = None,
     prompt: str | None = None,
     save_repoid: str | None = None,
     max_workers: int = 8,
@@ -300,7 +602,9 @@ def main(
 ):
     
     data_dir = Path(data_dir)
-    if type(repo_ids) is str:
+    if repo_ids is None:
+        repo_ids = []
+    elif type(repo_ids) is str:
         repo_ids = [repo_ids]
     
     task = data_dir.name.split('_')[0]
@@ -310,6 +614,25 @@ def main(
         # task = repoid[0]
         save_repoid = '_'.join(repoid[1: -1]) + '_lerobot'
         print(f"save_repoid will be set according to repo_ids: {save_repoid}")
+
+    if is_lerobot_v3_dataset(data_dir):
+        if repo_ids:
+            print("Ignoring --repo-ids because --data-dir already points to a LeRobot dataset root.")
+        output_path = convert_lerobot_v3_dataset(
+            data_dir=data_dir,
+            save_dir=save_dir,
+            save_repoid=save_repoid,
+            prompt=prompt,
+            max_workers=max_workers,
+            overwrite=overwrite,
+            only_sync=only_sync,
+        )
+        if upload:
+            raise NotImplementedError("--upload is only implemented for the legacy HDF5 cloth dataset path.")
+        return
+
+    if not repo_ids:
+        raise ValueError("--repo-ids is required when converting legacy HDF5 directories.")
 
     log_files: List[Path] = []
     for repo_id in repo_ids:

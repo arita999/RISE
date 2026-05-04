@@ -528,6 +528,7 @@ def train_loop(config: _config.TrainConfig):
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
+        foreach=False,
     )
 
     # Gradient accumulation counter

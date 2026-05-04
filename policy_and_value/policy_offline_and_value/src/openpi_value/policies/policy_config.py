@@ -82,13 +82,19 @@ def create_trained_policy(
             raise ValueError("Asset id is required to load norm stats.")
         # norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
              
-        try:
-            norm_stats = _checkpoints.load_norm_stats(
-                checkpoint_dir /  "assets", data_config.asset_id
-            )
-        except:
-            norm_stats = _checkpoints.load_norm_stats(
-                checkpoint_dir, data_config.asset_id
+        for assets_dir in (checkpoint_dir / "assets", checkpoint_dir):
+            try:
+                norm_stats = _checkpoints.load_norm_stats(assets_dir, data_config.asset_id)
+                break
+            except FileNotFoundError:
+                pass
+        if norm_stats is None:
+            norm_stats = data_config.norm_stats
+            if norm_stats is not None:
+                logging.info("Loaded norm stats from training config assets.")
+        if norm_stats is None:
+            raise FileNotFoundError(
+                f"Norm stats for asset_id={data_config.asset_id!r} were not found in the checkpoint or config assets."
             )
 
 

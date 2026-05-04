@@ -443,16 +443,14 @@ _CONFIGS = [
 
 
         data = LerobotCustomAgilexDataConfig(
-            repo_id = [
-                "data/sample_dataset",
-            ],
-            default_prompt="Insert the memory stick.",
+            repo_id="/run/media/kazu/storage/data/RISE/green_tag",
+            default_prompt="Untangle the parts",
             use_delta_joint_actions=False,
 
 
             assets=AssetsConfig(
                 assets_dir="data/norms",
-                asset_id="sample_dataset",
+                asset_id="green_tag",
             ),
         ),
 
@@ -484,16 +482,14 @@ _CONFIGS = [
         ),
         
         data = LerobotCustomAgilexDataConfig(
-            repo_id = [
-                "data/sample_dataset",
-            ],
+            repo_id="/run/media/kazu/storage/data/RISE/green_tag",
             
             assets=AssetsConfig(
                 assets_dir="data/norms",
-                asset_id="sample_dataset",
+                asset_id="green_tag",
             ),
             
-            default_prompt="fold the box.",
+            default_prompt="Untangle the parts",
             use_delta_joint_actions=False,
 
             repack_transforms=_transforms.Group(
@@ -501,9 +497,9 @@ _CONFIGS = [
                 _transforms.RepackTransform(
                     {
                         "images": {
-                            "top_head": "observation.images.top_head",
-                            "hand_left": "observation.images.hand_left",
-                            "hand_right": "observation.images.hand_right",
+                            "top_head": "observation.images.side",
+                            "hand_left": "observation.images.rear",
+                            "hand_right": "observation.images.onhand",
                         },
                         "state": "observation.state",
                         "actions": "action",
@@ -513,15 +509,15 @@ _CONFIGS = [
             ),
         ),
         
-        pytorch_weight_path="path/to/ckpt",
+        pytorch_weight_path=None,
 
         num_train_steps=100_000,
         keep_period=20000,
         save_interval=10000,
 
-        num_workers=8,
+        num_workers=4,
 
-        batch_size=64,  # * 8 gpus
+        batch_size=1,  # * 1 gpu
     ),
 
 

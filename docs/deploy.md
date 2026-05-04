@@ -67,6 +67,76 @@ pip install -e .
 
 Start the [openpi policy server](https://github.com/Physical-Intelligence/openpi) on your GPU machine first.
 
+### green_tag Policy Server
+
+For the `Pi05_style_training` run trained on the `green_tag` data, start the
+latest saved checkpoint with:
+
+```bash
+conda activate rise
+./deploy/serve_green_tag_policy.sh
+```
+
+If you want a specific checkpoint, pass it explicitly:
+
+```bash
+./deploy/serve_green_tag_policy.sh \
+  policy_and_value/policy_offline_and_value/checkpoints/Pi05_style_training/Pi05_style_training/10000
+```
+
+### Star AI Robot Arm
+
+The `green_tag` policy was trained with these camera mappings:
+
+- `observation.images.side` -> `top_head`
+- `observation.images.rear` -> `hand_left`
+- `observation.images.onhand` -> `hand_right`
+
+Run the generic Star AI Robot Arm ROS bridge after the policy server is up:
+
+```bash
+conda activate deploy
+./deploy/run_star_ai_green_tag.sh \
+  --host 172.16.99.11 \
+  --port 8000 \
+  --side_image_topic /camera_side/color/image_raw \
+  --rear_image_topic /camera_rear/color/image_raw \
+  --onhand_image_topic /camera_onhand/color/image_raw \
+  --joint_state_topic /joint_states \
+  --joint_cmd_topic /joint_command \
+  --joint_names joint0,joint1,joint2,joint3,joint4,joint5,joint6
+```
+
+Use `--dry_run` first to check camera, joint-state, and policy-server wiring
+without publishing robot commands. The script sends the Star arm state to the
+policy and publishes action dimensions `[0:7]` by default; use `--action_start`
+and `--arm_dof` if your Star command layout is different.
+
+For the Seeed StarAI Arm setup that does not use ROS, create the uv environment
+from the repository root and connect directly to the UC-01 serial port:
+
+```bash
+uv venv .venv-star --python 3.11
+source .venv-star/bin/activate
+uv pip install -r requirements.txt
+
+./deploy/run_star_ai_green_tag_no_ros.sh \
+  --host 172.16.99.11 \
+  --port 8000 \
+  --side_source 0 \
+  --rear_source 1 \
+  --onhand_source 2 \
+  --starai_port /dev/ttyUSB1 \
+  --dry_run \
+  --run_once \
+  --no_confirm
+```
+
+After dry-run succeeds, remove `--dry_run` and `--run_once` to publish actions
+directly to the StarAI follower arm.
+
+### Piper Dual Arms
+
 **Launch in 3 terminals:**
 
 ```bash

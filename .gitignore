@@ -6,6 +6,7 @@ checkpoints/
 dataset/
 dataset*/
 wandb/
+training_logs/
 vis/
 ckpts/
 ckpts
